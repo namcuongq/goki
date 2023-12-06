@@ -1,0 +1,6 @@
+# goki
+
+```
+.\goki.exe <pid>
+```
+
