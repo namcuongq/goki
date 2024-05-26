@@ -10,5 +10,11 @@ Usage of goki.exe:
 ## Features
 ![](https://raw.githubusercontent.com/namcuongq/goki/main/image/features.png)
 
-## Demo
+## Demo 1
+#### Step 1
+![](https://raw.githubusercontent.com/namcuongq/goki/main/image/poc1.png)
+#### Step 2
+![](https://raw.githubusercontent.com/namcuongq/goki/main/image/poc2.png)
+
+## Demo 2
 ![](https://raw.githubusercontent.com/namcuongq/goki/main/image/image.png)
